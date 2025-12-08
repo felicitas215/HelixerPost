@@ -81,7 +81,7 @@ impl<'a, TC: ArrayConvInto<ClassPrediction>, TP: ArrayConvInto<PhasePrediction>>
         self.window.len() == self.window_size
     }
 
-    pub fn get_window_iter(&self) -> Iter<(Bases, ClassPrediction, PhasePrediction)> {
+    pub fn get_window_iter(&'a self) -> Iter<'a, (Bases, ClassPrediction, PhasePrediction)> {
         self.window.iter()
     }
 }
