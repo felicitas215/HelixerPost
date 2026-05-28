@@ -585,7 +585,7 @@ impl<'a> TransitionContext<'a> {
 }
 
 #[allow(dead_code)]
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
 pub enum HmmAnnotationLabel {
     Intergenic,
     UTR5,
@@ -2207,3 +2207,164 @@ Chr1    HelixerPost     CDS     24546   24655   .       +       0       ID=Athal
 
 
  */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- numeric primitives ---
+
+    /// Inputs below the floor are clamped before the log so penalties stay
+    /// finite. `1.0` collapses to a penalty of `0.0`. Tweak these constants
+    /// at your peril.
+    #[test]
+    fn raw_pred_to_neg_log_prob_clamps_to_floor_and_logs() {
+        let floor = 1e-9_f64;
+        let out = raw_pred_to_neg_log_prob(&[0.0, 1e-12, 0.5, 1.0], floor);
+        let floored = -(floor.log2());
+        assert!((out[0] - floored).abs() < 1e-12, "0.0 should be clamped to floor");
+        assert!((out[1] - floored).abs() < 1e-12, "1e-12 should be clamped to floor");
+        assert!((out[2] - 1.0).abs() < 1e-12, "-log2(0.5) == 1.0");
+        assert!(out[3].abs() < 1e-12, "-log2(1.0) == 0.0");
+    }
+
+    #[test]
+    fn neg_log_prob_to_penalty_subtracts_minimum() {
+        let pen = neg_log_prob_to_penalty(&[5.0_f64, 2.0, 3.0, 7.0]);
+        assert_eq!(pen, [3.0, 0.0, 1.0, 5.0]);
+    }
+
+    /// The "winning" base in a one-hot Bases has penalty 0, so `as_str`
+    /// returns it. Two bases pre-normalisation -> after penalty conversion
+    /// the wrong one still differs from zero by more than APPROX_ZERO.
+    #[test]
+    fn bases_penalty_as_str_returns_winner() {
+        // Pure-A
+        let pen = BasesPenalty::new(&Bases::new([0.0, 1.0, 0.0, 0.0]), 1e-9);
+        assert_eq!(pen.as_str(), 'A');
+        // Pure-T
+        let pen = BasesPenalty::new(&Bases::new([0.0, 0.0, 1.0, 0.0]), 1e-9);
+        assert_eq!(pen.as_str(), 'T');
+        // Pure-G
+        let pen = BasesPenalty::new(&Bases::new([0.0, 0.0, 0.0, 1.0]), 1e-9);
+        assert_eq!(pen.as_str(), 'G');
+        // Pure-C
+        let pen = BasesPenalty::new(&Bases::new([1.0, 0.0, 0.0, 0.0]), 1e-9);
+        assert_eq!(pen.as_str(), 'C');
+    }
+
+    // --- PredPenalty phase-blending math ---
+
+    /// When the model emits zero for all three coding-phase channels the
+    /// constructor falls back to an even coding/3 split per phase, then
+    /// blends with the dilution target. With phase_retain == 0 the result
+    /// must equal pure-coding probability for each phase.
+    /// (Tolerance is loose because raw probs go through f32->f64.)
+    #[test]
+    fn pred_penalty_handles_zero_phase_with_phase_retain_zero() {
+        let class = ClassPrediction::new([0.7, 0.0, 0.3, 0.0]); // 0.3 coding
+        let phase = PhasePrediction::new([1.0, 0.0, 0.0, 0.0]); // all in non-coding
+        let pp = PredPenalty::new(&class, &phase, 1e-9, 0.0);
+
+        // raw_probs layout (post-blend): [intergenic, utr, phase0, phase1, phase2, intron]
+        // With phase_retain=0 the dilution_target (= coding) wins; phase0/1/2 = coding = 0.3.
+        let intergenic_nlp = -(0.7_f32 as f64).log2();
+        let coding_nlp = -(0.3_f32 as f64).log2();
+        assert!((pp.neg_log_prob[0] - intergenic_nlp).abs() < 1e-6);
+        assert!((pp.neg_log_prob[2] - coding_nlp).abs() < 1e-6);
+        assert!((pp.neg_log_prob[3] - coding_nlp).abs() < 1e-6);
+        assert!((pp.neg_log_prob[4] - coding_nlp).abs() < 1e-6);
+    }
+
+    /// With phase_retain == 1 (trust the predicted phase fully) and a perfect
+    /// phase-0 prediction, the three phase channels should split coding
+    /// fully into phase 0.
+    #[test]
+    fn pred_penalty_full_phase_retain_routes_coding_into_predicted_phase() {
+        let class = ClassPrediction::new([0.1, 0.0, 0.9, 0.0]); // 0.9 coding
+        let phase = PhasePrediction::new([0.0, 1.0, 0.0, 0.0]); // phase 0
+        let pp = PredPenalty::new(&class, &phase, 1e-9, 1.0);
+
+        let phase0_nlp = -(0.9_f32 as f64).log2();
+        // Phase 1 and 2 receive ~0 probability — penalty bottoms out at the floor.
+        let floor_nlp = -(1e-9_f64).log2();
+        assert!((pp.neg_log_prob[2] - phase0_nlp).abs() < 1e-6);
+        assert!((pp.neg_log_prob[3] - floor_nlp).abs() < 1e-6);
+        assert!((pp.neg_log_prob[4] - floor_nlp).abs() < 1e-6);
+    }
+
+    // --- HmmStateRegion::split_genes ---
+
+    fn region(start: usize, end: usize, label: HmmAnnotationLabel) -> HmmStateRegion {
+        HmmStateRegion::new(start, end, label, 0, 0, 0, 0)
+    }
+
+    /// `split_genes` flushes the current bucket each time it hits an
+    /// intergenic *after* the bucket already has content. The intergenic
+    /// itself is pushed into the *next* bucket. So a leading intergenic
+    /// stays inside the first gene, and a trailing intergenic becomes a
+    /// final bucket of its own.
+    #[test]
+    fn split_genes_partitions_on_intergenic_and_sums_coding() {
+        let regions = vec![
+            region(0, 100, HmmAnnotationLabel::Intergenic),
+            region(100, 110, HmmAnnotationLabel::UTR5),
+            region(110, 113, HmmAnnotationLabel::Start),
+            region(113, 200, HmmAnnotationLabel::Coding),
+            region(200, 203, HmmAnnotationLabel::Stop),
+            region(203, 210, HmmAnnotationLabel::UTR3),
+            region(210, 500, HmmAnnotationLabel::Intergenic),
+            region(500, 600, HmmAnnotationLabel::Coding),
+            region(600, 700, HmmAnnotationLabel::Intergenic),
+        ];
+        let genes = HmmStateRegion::split_genes(regions);
+        assert_eq!(genes.len(), 3);
+
+        // Bucket 0: leading Intergenic + first full gene structure.
+        // Coding length = 200 - 113 = 87.
+        assert_eq!(genes[0].1, 87);
+        assert_eq!(genes[0].0.len(), 6);
+        assert_eq!(
+            genes[0].0[0].get_annotation_label(),
+            HmmAnnotationLabel::Intergenic
+        );
+
+        // Bucket 1: middle Intergenic + Coding(500,600). Coding length = 100.
+        assert_eq!(genes[1].1, 100);
+        assert_eq!(genes[1].0.len(), 2);
+        assert_eq!(
+            genes[1].0[0].get_annotation_label(),
+            HmmAnnotationLabel::Intergenic
+        );
+
+        // Bucket 2: trailing Intergenic alone, no coding.
+        assert_eq!(genes[2].1, 0);
+        assert_eq!(genes[2].0.len(), 1);
+        assert_eq!(
+            genes[2].0[0].get_annotation_label(),
+            HmmAnnotationLabel::Intergenic
+        );
+    }
+
+    /// Regions with no intergenic at all stay in a single bucket. Coding
+    /// length still totals only Coding regions, not Start/Stop/UTR.
+    #[test]
+    fn split_genes_no_intergenic_single_bucket() {
+        let regions = vec![
+            region(0, 5, HmmAnnotationLabel::UTR5),
+            region(5, 8, HmmAnnotationLabel::Start),
+            region(8, 50, HmmAnnotationLabel::Coding),
+            region(50, 53, HmmAnnotationLabel::Stop),
+        ];
+        let genes = HmmStateRegion::split_genes(regions);
+        assert_eq!(genes.len(), 1);
+        assert_eq!(genes[0].1, 42); // only the 8..50 Coding region counts
+        assert_eq!(genes[0].0.len(), 4);
+    }
+
+    #[test]
+    fn split_genes_empty_input_yields_no_genes() {
+        let genes = HmmStateRegion::split_genes(Vec::new());
+        assert!(genes.is_empty());
+    }
+}

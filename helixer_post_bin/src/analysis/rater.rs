@@ -572,7 +572,7 @@ impl<W: Write> RatingWriter<W> {
 
 #[cfg(test)]
 mod tests {
-    use crate::analysis::rater::ConfusionMatrix;
+    use crate::analysis::rater::{calc_precision_recall_f1, ConfusionMatrix};
 
     #[test]
     fn test_confusion_empty_matrix() {
@@ -629,5 +629,72 @@ mod tests {
             assert_eq!(matrix.get_fp(i), 0);
             assert_eq!(matrix.get_fn(i), 2);
         }
+    }
+
+    #[test]
+    fn test_confusion_accumulate() {
+        let mut a = ConfusionMatrix::<3>::new();
+        a.increment(0, 0);
+        a.increment(1, 2);
+
+        let mut b = ConfusionMatrix::<3>::new();
+        b.increment(0, 0);
+        b.increment(2, 2);
+
+        a.accumulate(&b);
+
+        assert_eq!(a.get_tp(0), 2);
+        assert_eq!(a.get_tp(2), 1);
+        assert_eq!(a.get_fn(1), 1); // ref=1 pred=2 from `a`'s own pre-accumulate state
+        assert_eq!(a.get_fp(2), 1); // same row above
+    }
+
+    /// All-zero inputs (no positives in reference or prediction) must yield
+    /// NaN rather than panic or 0. `SequenceRater::calculate_stats` produces
+    /// these every time a class doesn't appear in a window.
+    #[test]
+    fn precision_recall_f1_division_by_zero_yields_nan() {
+        let (p, r, f1) = calc_precision_recall_f1(0, 0, 0);
+        assert!(p.is_nan());
+        assert!(r.is_nan());
+        assert!(f1.is_nan());
+    }
+
+    #[test]
+    fn precision_recall_f1_perfect_classifier() {
+        let (p, r, f1) = calc_precision_recall_f1(100, 0, 0);
+        assert_eq!(p, 1.0);
+        assert_eq!(r, 1.0);
+        assert_eq!(f1, 1.0);
+    }
+
+    #[test]
+    fn precision_recall_f1_known_values() {
+        let (p, r, f1) = calc_precision_recall_f1(50, 10, 20);
+        // P = 50 / (50+10) = 5/6, R = 50 / (50+20) = 5/7,
+        // F1 = (2 * 50) / (2*50 + 10 + 20) = 100/130.
+        assert!((p - 50.0 / 60.0).abs() < 1e-12);
+        assert!((r - 50.0 / 70.0).abs() < 1e-12);
+        assert!((f1 - 100.0 / 130.0).abs() < 1e-12);
+    }
+
+    /// Cross-check the matrix's own get_precision_recall_f1 against the bare
+    /// helper, on a small hand-built confusion. Catches row/column swaps.
+    #[test]
+    fn confusion_matrix_precision_recall_f1_matches_helper() {
+        let mut m = ConfusionMatrix::<3>::new();
+        // class 0: 4 TP, plus 1 FP (ref=1 pred=0), plus 2 FN (ref=0 pred=2 twice)
+        for _ in 0..4 {
+            m.increment(0, 0);
+        }
+        m.increment(1, 0);
+        m.increment(0, 2);
+        m.increment(0, 2);
+
+        let (p, r, f1) = m.get_precision_recall_f1(0);
+        let (ep, er, ef1) = calc_precision_recall_f1(4, 1, 2);
+        assert!((p - ep).abs() < 1e-12);
+        assert!((r - er).abs() < 1e-12);
+        assert!((f1 - ef1).abs() < 1e-12);
     }
 }

@@ -11,7 +11,7 @@ use crate::analysis::hmm::{HmmConfig, HmmStateRegion, PredictionHmm};
 use crate::analysis::rater::{RatingWriter, SequenceRater, SequenceRating};
 use crate::analysis::window::BasePredictionWindowThresholdIterator;
 use crate::gff::GffWriter;
-use crate::results::conv::{ArrayConvInto, ClassPrediction, PhasePrediction};
+use crate::results::conv::{ArrayConvInto, Bases, ClassPrediction, PhasePrediction};
 use crate::results::{Sequence, Species};
 use std::io::Write;
 
@@ -136,16 +136,20 @@ impl<'a, TC: ArrayConvInto<ClassPrediction>, TP: ArrayConvInto<PhasePrediction>>
         self.comp_extractor.has_ref()
     }
 
-    fn process_sequence_1d<W: Write>(
+    fn process_sequence_1d<W, BPI>(
         &self,
         species: &Species,
         seq: &Sequence,
         rev: bool,
-        bp_iter: BasePredictionWindowThresholdIterator<TC, TP>,
+        bp_iter: BasePredictionWindowThresholdIterator<BPI>,
         gene_idx: &mut usize,
         rater: &mut SequenceRater,
         gff_writer: &mut GffWriter<W>,
-    ) -> Result<(usize, usize)> {
+    ) -> Result<(usize, usize)>
+    where
+        W: Write,
+        BPI: Iterator<Item = (Bases, ClassPrediction, PhasePrediction)>,
+    {
         let min_coding_length = self.filter_cfg.min_coding_length;
         let mut window_count = 0;
         let mut window_length_total = 0;
