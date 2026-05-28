@@ -1,7 +1,9 @@
 use super::super::{Error, Result};
 use hdf5_metno::types::FixedAscii;
-use hdf5_metno::{Dataset, File};
+use hdf5_metno::{Dataset, File, H5Type};
 use std::path::Path;
+use ndarray::{Array1, Array2};
+use crate::results::error::FromCtx;
 
 //use ndarray::iter::Iter;
 
@@ -37,7 +39,14 @@ impl RawHelixerGenome {
         blocks: usize,
         blocksize: usize,
     ) -> Result<RawHelixerGenome> {
-        let genome_file = File::open(genome_file_path)?;
+        let genome_file = match File::open(genome_file_path) {
+            Ok(f) => f,
+            Err(e) => {
+                let ctx = format!("opening {genome_file_path:?} as genome HDF5");
+                return Err(Error::from_ctx(&ctx, e))
+            }
+        };
+
         Ok(RawHelixerGenome {
             genome_file,
             blocks,
@@ -121,56 +130,93 @@ impl RawHelixerGenome {
         Ok(())
     }
 
+    fn get_dataset_raw(&self, name: &str) -> Result<Dataset> {
+        let dataset = match self.genome_file.dataset(name) {
+            Ok(f) => f,
+            Err(e) => {
+                let ctx = format!("reading '{name}' dataset from genome HDF5");
+                return Err(Error::from_ctx(&ctx, e))
+            }
+        };
+
+        Ok(dataset)
+    }
+
+    fn read_dataset_1d<T: H5Type>(dataset: Dataset, name: &str) -> Result<Array1<T>> {
+        let a = match dataset.read_1d::<T>() {
+            Ok(a) => a,
+            Err(e) => {
+                let ctx = format!("reading 1D array from '{name}' dataset from genome HDF5");
+                return Err(Error::from_ctx(&ctx, e))
+            }
+        };
+
+        Ok(a)
+    }
+
+    fn read_dataset_2d<T: H5Type>(dataset: Dataset, name: &str) -> Result<Array2<T>> {
+        let a = match dataset.read_2d::<T>() {
+            Ok(a) => a,
+            Err(e) => {
+                let ctx = format!("reading 2D array from '{name}' dataset from genome HDF5");
+                return Err(Error::from_ctx(&ctx, e))
+            }
+        };
+
+        Ok(a)
+    }
+
+
     pub fn get_x_raw(&self) -> Result<Dataset> {
-        let dataset = self.genome_file.dataset("data/X")?;
+
+        let dataset = self.get_dataset_raw("data/X")?;
         self.validate_dataset_shape_blocksize_array(&dataset, X_DATASIZE)?;
         Ok(dataset)
     }
 
     pub fn get_err_samples_raw(&self) -> Result<Dataset> {
-        let dataset = self.genome_file.dataset("data/err_samples")?;
+        let dataset = self.get_dataset_raw("data/err_samples")?;
         self.validate_dataset_shape_scalar(&dataset)?;
         Ok(dataset)
     }
 
     pub fn get_err_samples(&self) -> Result<Vec<bool>> {
         let err_samples_ds = self.get_err_samples_raw()?;
-        let err_samples_array = err_samples_ds.read_1d::<bool>()?;
+        let err_samples_array = Self::read_dataset_1d(err_samples_ds, "data/err_samples")?;
         Ok(err_samples_array.to_vec())
-
         //      let err_samples_array = err_samples_ds.read_1d::<ErrSamples>()?;
         //      Ok(err_samples_array.iter().map(|x| *x == ErrSamples::TRUE).collect())
     }
 
     pub fn get_fully_intergenic_samples_raw(&self) -> Result<Dataset> {
-        let dataset = self.genome_file.dataset("data/fully_intergenic_samples")?;
+        let dataset = self.get_dataset_raw("data/fully_intergenic_samples")?;
         self.validate_dataset_shape_scalar(&dataset)?;
         Ok(dataset)
     }
 
     pub fn get_fully_intergenic_samples(&self) -> Result<Vec<bool>> {
         let fully_ig_samples_ds = self.get_fully_intergenic_samples_raw()?;
-        let fully_ig_samples_array = fully_ig_samples_ds.read_1d::<bool>()?;
+        let fully_ig_samples_array = Self::read_dataset_1d(fully_ig_samples_ds, "data/fully_intergenic_samples")?;
         Ok(fully_ig_samples_array.to_vec())
     }
 
     // For pre-annotated
     pub fn get_gene_lengths_raw(&self) -> Result<Dataset> {
-        let dataset = self.genome_file.dataset("data/gene_lengths")?;
+        let dataset = self.get_dataset_raw("data/gene_lengths")?;
         self.validate_dataset_shape_blocksize_scalar(&dataset)?;
         Ok(dataset)
     }
 
     // For pre-annotated
     pub fn get_is_annotated_raw(&self) -> Result<Dataset> {
-        let dataset = self.genome_file.dataset("data/is_annotated")?;
+        let dataset = self.get_dataset_raw("data/is_annotated")?;
         self.validate_dataset_shape_scalar(&dataset)?;
         Ok(dataset)
     }
 
     pub fn get_is_annotated(&self) -> Result<Vec<bool>> {
         let is_annotated_ds = self.get_is_annotated_raw()?;
-        let is_annotated_array = is_annotated_ds.read_1d::<bool>()?;
+        let is_annotated_array = Self::read_dataset_1d(is_annotated_ds, "data/is_annotated")?;
         Ok(is_annotated_array.to_vec())
     }
 
@@ -180,53 +226,50 @@ impl RawHelixerGenome {
             return Ok(None);
         }
 
-        let dataset = self.genome_file.dataset("data/phases")?;
+        let dataset = self.get_dataset_raw("data/phases")?;
         self.validate_dataset_shape_blocksize_array(&dataset, PHASE_DATASIZE)?;
         Ok(Some(dataset))
     }
 
     pub fn get_sample_weights_raw(&self) -> Result<Dataset> {
-        let dataset = self.genome_file.dataset("data/sample_weights")?;
+        let dataset = self.get_dataset_raw("data/sample_weights")?;
         self.validate_dataset_shape_blocksize_scalar(&dataset)?;
         Ok(dataset)
     }
 
     pub fn get_seqids_raw(&self) -> Result<Dataset> {
-        let dataset = self.genome_file.dataset("data/seqids")?;
+        let dataset = self.get_dataset_raw("data/seqids")?;
         self.validate_dataset_shape_scalar(&dataset)?;
         Ok(dataset)
     }
 
     pub fn get_seqids(&self) -> Result<Vec<String>> {
         let seqids_ds = self.get_seqids_raw()?;
-        let seqids_array = seqids_ds.read_1d::<SeqidsType>()?;
-
+        let seqids_array = Self::read_dataset_1d::<SeqidsType>(seqids_ds, "data/seqids")?;
         Ok(seqids_array.iter().map(|x| x.to_string()).collect())
     }
 
     pub fn get_species_raw(&self) -> Result<Dataset> {
-        let dataset = self.genome_file.dataset("data/species")?;
+        let dataset = self.get_dataset_raw("data/species")?;
         self.validate_dataset_shape_scalar(&dataset)?;
         Ok(dataset)
     }
 
     pub fn get_species(&self) -> Result<Vec<String>> {
         let species_ds = self.get_species_raw()?;
-        let species_array = species_ds.read_1d::<SpeciesType>()?;
-
+        let species_array = Self::read_dataset_1d::<SpeciesType>(species_ds, "data/species")?;
         Ok(species_array.iter().map(|x| x.to_string()).collect())
     }
 
     pub fn get_start_ends_raw(&self) -> Result<Dataset> {
-        let dataset = self.genome_file.dataset("data/start_ends")?;
+        let dataset = self.get_dataset_raw("data/start_ends")?;
         self.validate_dataset_shape_array(&dataset, STARTENDS_DATASIZE)?;
         Ok(dataset)
     }
 
     pub fn get_start_ends(&self) -> Result<Vec<(u64, u64)>> {
         let startends_ds = self.get_start_ends_raw()?;
-        let startends_array = startends_ds.read_2d::<i64>()?;
-
+        let startends_array = Self::read_dataset_2d::<i64>(startends_ds, "data/starts_ends")?;
         Ok(startends_array
             .outer_iter()
             .map(|x| (x[0] as u64, x[1] as u64))
@@ -235,7 +278,7 @@ impl RawHelixerGenome {
 
     // For pre-annotated
     pub fn get_transitions_raw(&self) -> Result<Dataset> {
-        let dataset = self.genome_file.dataset("data/transitions")?;
+        let dataset = self.get_dataset_raw("data/transitions")?;
         self.validate_dataset_shape_blocksize_array(&dataset, TRANSITIONS_DATASIZE)?;
         Ok(dataset)
     }
@@ -246,7 +289,7 @@ impl RawHelixerGenome {
             return Ok(None);
         }
 
-        let dataset = self.genome_file.dataset("data/y")?;
+        let dataset = self.get_dataset_raw("data/y")?;
         self.validate_dataset_shape_blocksize_array(&dataset, Y_DATASIZE)?;
         Ok(Some(dataset))
     }

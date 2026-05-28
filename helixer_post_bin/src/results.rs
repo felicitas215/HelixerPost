@@ -23,7 +23,7 @@ pub struct HelixerResults {
     index: HelixerIndex,
 }
 
-impl HelixerResults {
+impl<'a> HelixerResults {
     pub fn new(predictions_path: &Path, genome_path: &Path) -> Result<HelixerResults> {
         let predictions = RawHelixerPredictions::new(predictions_path)?;
         let (blocks, blocksize) = predictions.get_blocks_and_blocksize()?;
@@ -103,21 +103,21 @@ impl HelixerResults {
 
     // Wrapped dataset accessors for large datasets, delegate smaller datasets to standard collection converters
 
-    pub fn get_class_predictions(&self) -> Result<BlockedDataset2D<f32, ClassPrediction>> {
+    pub fn get_class_predictions(&'a self) -> Result<BlockedDataset2D<'a, f32, ClassPrediction>> {
         Ok(BlockedDataset2D::new(
             &self.index,
             self.predictions.get_class_raw()?,
         ))
     }
 
-    pub fn get_phase_predictions(&self) -> Result<BlockedDataset2D<f32, PhasePrediction>> {
+    pub fn get_phase_predictions(&'a self) -> Result<BlockedDataset2D<'a, f32, PhasePrediction>> {
         Ok(BlockedDataset2D::new(
             &self.index,
             self.predictions.get_phase_raw()?,
         ))
     }
 
-    pub fn get_x(&self) -> Result<BlockedDataset2D<f32, Bases>> {
+    pub fn get_x(&'a self) -> Result<BlockedDataset2D<'a, f32, Bases>> {
         Ok(BlockedDataset2D::new(&self.index, self.genome.get_x_raw()?))
     }
 
@@ -140,7 +140,7 @@ impl HelixerResults {
         self.genome.get_fully_intergenic_samples()
     }
 
-    pub fn get_gene_lengths(&self) -> Result<BlockedDataset1D<u32>> {
+    pub fn get_gene_lengths(&'a self) -> Result<BlockedDataset1D<'a, u32>> {
         Ok(BlockedDataset1D::new(
             &self.index,
             self.genome.get_gene_lengths_raw()?,
@@ -151,21 +151,21 @@ impl HelixerResults {
         self.genome.get_is_annotated()
     }
 
-    pub fn get_sample_weights(&self) -> Result<BlockedDataset1D<i8>> {
+    pub fn get_sample_weights(&'a self) -> Result<BlockedDataset1D<'a, i8>> {
         Ok(BlockedDataset1D::new(
             &self.index,
             self.genome.get_sample_weights_raw()?,
         ))
     }
 
-    pub fn get_transitions(&self) -> Result<BlockedDataset2D<i8, Transitions>> {
+    pub fn get_transitions(&'a self) -> Result<BlockedDataset2D<'a, i8, Transitions>> {
         Ok(BlockedDataset2D::new(
             &self.index,
             self.genome.get_transitions_raw()?,
         ))
     }
 
-    pub fn get_class_reference(&self) -> Result<Option<BlockedDataset2D<i8, ClassReference>>> {
+    pub fn get_class_reference(&'a self) -> Result<Option<BlockedDataset2D<'a, i8, ClassReference>>> {
         match self.genome.get_y_raw()? {
             Some(dataset) => Ok(Some(BlockedDataset2D::new(&self.index, dataset))),
             None => Ok(None),
@@ -173,15 +173,15 @@ impl HelixerResults {
     }
 
     pub fn get_class_reference_as_pseudo_predictions(
-        &self,
-    ) -> Result<Option<BlockedDataset2D<i8, ClassPrediction>>> {
+        &'a self,
+    ) -> Result<Option<BlockedDataset2D<'a, i8, ClassPrediction>>> {
         match self.genome.get_y_raw()? {
             Some(dataset) => Ok(Some(BlockedDataset2D::new(&self.index, dataset))),
             None => Ok(None),
         }
     }
 
-    pub fn get_phase_reference(&self) -> Result<Option<BlockedDataset2D<i8, PhaseReference>>> {
+    pub fn get_phase_reference(&'a self) -> Result<Option<BlockedDataset2D<'a, i8, PhaseReference>>> {
         match self.genome.get_phases_raw()? {
             Some(dataset) => Ok(Some(BlockedDataset2D::new(&self.index, dataset))),
             None => Ok(None),
@@ -189,8 +189,8 @@ impl HelixerResults {
     }
 
     pub fn get_phase_reference_as_pseudo_predictions(
-        &self,
-    ) -> Result<Option<BlockedDataset2D<i8, PhasePrediction>>> {
+        &'a self,
+    ) -> Result<Option<BlockedDataset2D<'a, i8, PhasePrediction>>> {
         match self.genome.get_phases_raw()? {
             Some(dataset) => Ok(Some(BlockedDataset2D::new(&self.index, dataset))),
             None => Ok(None),

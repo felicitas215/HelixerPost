@@ -1,7 +1,11 @@
 use std::fmt::{self, Debug, Display};
 
+pub trait FromCtx<T> {
+    fn from_ctx(ctx: &str, t: T) -> Self;
+}
+
 pub enum Error {
-    Hdf5(hdf5_metno::Error),
+    Hdf5(String, hdf5_metno::Error),
     MismatchedDimensions(usize, usize),
     MismatchedBlockCount(usize, usize),
     MismatchedBlockSize(usize, usize),
@@ -22,11 +26,29 @@ impl Debug for Error {
     }
 }
 
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Hdf5(_, err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl FromCtx<hdf5_metno::Error> for Error {
+    fn from_ctx(ctx: &str, hdf5_error: hdf5_metno::Error) -> Error
+    {
+        Error::Hdf5(ctx.to_owned(), hdf5_error)
+    }
+}
+
+/*
 impl From<hdf5_metno::Error> for Error {
     fn from(hdf5_error: hdf5_metno::Error) -> Self {
         Self::Hdf5(hdf5_error)
     }
 }
+*/
 
 impl From<&str> for Error {
     fn from(msg: &str) -> Self {
@@ -37,7 +59,10 @@ impl From<&str> for Error {
 impl Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            Error::Hdf5(err) => Display::fmt(err, f),
+            Error::Hdf5(ctx, err) => {
+                write!(f, "HDF5 error {}: ", ctx)?;
+                Display::fmt(err, f)
+            }
             Error::MismatchedDimensions(found, expected) => write!(
                 f,
                 "Mismatched Dimensions Found {}, expected {}",

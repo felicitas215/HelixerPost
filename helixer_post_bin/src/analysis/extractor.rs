@@ -146,7 +146,7 @@ impl<'a, TC: ArrayConvInto<ClassPrediction>, TP: ArrayConvInto<PhasePrediction>>
         }
     }
 
-    pub fn get_extractor(&self) -> &BasePredictionExtractor<TC, TP> {
+    pub fn get_extractor(&'a self) -> &'a BasePredictionExtractor<'a, TC, TP> {
         self.extractor
     }
 
@@ -317,7 +317,7 @@ impl<'a> ComparisonIterator<'a> {
         }
     }
 
-    pub fn get_extractor(&self) -> &ComparisonExtractor {
+    pub fn get_extractor(&'a self) -> &'a ComparisonExtractor<'a> {
         self.extractor
     }
 

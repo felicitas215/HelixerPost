@@ -1,6 +1,165 @@
 use crate::results::conv::{Bases, ClassPrediction, PhasePrediction};
+use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use std::sync::Arc;
+
+/// User-tunable HMM parameters. Built with `HmmConfig::default()` and
+/// optionally overridden by a YAML config file and/or CLI flags.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HmmConfig {
+    /// Lower bound applied to raw class/phase/base probabilities before taking
+    /// the negative log, to keep penalties finite when the model emits ~0.
+    pub prob_floor: f64,
+    /// Weight given to the predicted phase signal when blended with the
+    /// uniform coding-phase dilution target. 1.0 = trust phase fully, 0.0 =
+    /// ignore phase predictions entirely.
+    pub phase_retain: f64,
+    /// Per-transition booleans gating which splice-junction types the decoder
+    /// will consider in each surrounding context.
+    pub splice: SpliceFlags,
+    /// Multiplicative weights for the start / stop / donor / acceptor signals
+    /// when they enter the per-base penalty sum.
+    pub weights: HmmWeights,
+    /// Constant penalty added when accepting each donor variant, independent
+    /// of the local base signal. Use to bias against rare splice types.
+    pub donor_fixed_penalty: DonorFixedPenalties,
+}
+
+impl Default for HmmConfig {
+    fn default() -> Self {
+        Self {
+            prob_floor: 0.000_000_001,
+            phase_retain: 0.20,
+            splice: SpliceFlags::default(),
+            weights: HmmWeights::default(),
+            donor_fixed_penalty: DonorFixedPenalties::default(),
+        }
+    }
+}
+
+impl HmmConfig {
+    pub fn phase_dilute(&self) -> f64 {
+        1.0 - self.phase_retain
+    }
+
+    pub fn with_overrides(
+        mut self,
+        prob_floor: Option<f64>,
+        phase_retain: Option<f64>,
+        start_weight: Option<f64>,
+        stop_weight: Option<f64>,
+        donor_weight: Option<f64>,
+        acceptor_weight: Option<f64>,
+    ) -> Self {
+        if let Some(v) = prob_floor {
+            self.prob_floor = v;
+        }
+        if let Some(v) = phase_retain {
+            self.phase_retain = v;
+        }
+        if let Some(v) = start_weight {
+            self.weights.start = v;
+        }
+        if let Some(v) = stop_weight {
+            self.weights.stop = v;
+        }
+        if let Some(v) = donor_weight {
+            self.weights.donor = v;
+        }
+        if let Some(v) = acceptor_weight {
+            self.weights.acceptor = v;
+        }
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SpliceFlags {
+    pub utr5: bool,
+    pub utr5_start: bool,
+    pub start: bool,
+    pub start_coding: bool,
+    pub coding: bool,
+    pub coding_stop: bool,
+    pub stop: bool,
+    pub stop_utr3: bool,
+    pub utr3: bool,
+}
+
+impl Default for SpliceFlags {
+    fn default() -> Self {
+        Self {
+            utr5: true,
+            utr5_start: true,
+            start: true,
+            start_coding: true,
+            coding: true,
+            coding_stop: true,
+            stop: true,
+            stop_utr3: true,
+            utr3: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HmmWeights {
+    pub start: f64,
+    pub stop: f64,
+    pub donor: f64,
+    pub acceptor: f64,
+}
+
+impl Default for HmmWeights {
+    fn default() -> Self {
+        Self {
+            start: 1_000.0,
+            stop: 1_000.0,
+            donor: 1.0,
+            acceptor: 1.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DonorFixedPenalties {
+    pub u2_gt_ag: f64,
+    pub u2_gc_ag: f64,
+    pub u12_gt_ag: f64,
+    pub u12_at_ac: f64,
+}
+
+pub fn show_hmm_config(cfg: &HmmConfig) {
+    let s = &cfg.splice;
+    let w = &cfg.weights;
+    let p = &cfg.donor_fixed_penalty;
+    println!("HMM Config");
+    println!(
+        "  Splicing Flags: U:{} US:{} S:{} SC:{} C:{} CS:{} S:{} SU:{} U:{}",
+        s.utr5, s.utr5_start, s.start, s.start_coding, s.coding,
+        s.coding_stop, s.stop, s.stop_utr3, s.utr3,
+    );
+    println!(
+        "  Splicing - Weights: Donor {}, Acceptor {}",
+        w.donor, w.acceptor,
+    );
+    println!(
+        "  Splicing - Fixed Penalties: U2-GT-AG {}, U2-GC-AG {} U12-GT-AG {} U12-AT-AC {}",
+        p.u2_gt_ag, p.u2_gc_ag, p.u12_gt_ag, p.u12_at_ac,
+    );
+    println!("  Coding - Weights: Start {}, Stop {}", w.start, w.stop);
+    println!(
+        "  Phase Mode: Implementation 1, Dilute to Total, Retention: {}",
+        cfg.phase_retain,
+    );
+    println!("  Prob Floor: {}", cfg.prob_floor);
+    println!();
+}
 
 
 fn convert_raw_pred<const N: usize>(raw_pred: &[f32; N]) -> [f64; N] {
@@ -72,14 +231,12 @@ impl ClassPredPenalty {
     }
 }
 
-const CLASS_PRED_PROB_FLOOR: f64 = 0.000_000_001; // Prevent infinite penalties
-
-impl From<&ClassPrediction> for ClassPredPenalty {
-    fn from(pred: &ClassPrediction) -> Self {
+impl ClassPredPenalty {
+    fn new(pred: &ClassPrediction, prob_floor: f64) -> Self {
         let raw_pred = pred.get();
 
         let converted_pred = convert_raw_pred(raw_pred);
-        let neg_log_prob = raw_pred_to_neg_log_prob(&converted_pred, CLASS_PRED_PROB_FLOOR);
+        let neg_log_prob = raw_pred_to_neg_log_prob(&converted_pred, prob_floor);
         let penalty = neg_log_prob_to_penalty(&neg_log_prob);
 
         ClassPredPenalty { /*neg_log_prob,*/ penalty }
@@ -111,15 +268,12 @@ impl PhasePredPenalty {
     }
 }
 
-const PHASE_PRED_PROB_FLOOR: f64 = 0.000_000_001; // Prevent infinite penalties
-                                                  //const PHASE_PRED_PROB_FLOOR: f64 = 0.5; // Limit impact of incorrect phase
-
-impl From<&PhasePrediction> for PhasePredPenalty {
-    fn from(pred: &PhasePrediction) -> Self {
+impl PhasePredPenalty {
+    fn new(pred: &PhasePrediction, prob_floor: f64) -> Self {
         let raw_pred = pred.get();
 
         let converted_pred = convert_raw_pred(raw_pred);
-        let neg_log_prob = raw_pred_to_neg_log_prob(&converted_pred, PHASE_PRED_PROB_FLOOR);
+        let neg_log_prob = raw_pred_to_neg_log_prob(&converted_pred, prob_floor);
         let penalty = neg_log_prob_to_penalty(&neg_log_prob);
 
         PhasePredPenalty { /* neg_log_prob, */ penalty }
@@ -178,13 +332,15 @@ impl PredPenalty {
 
 }
 
-const PHASE_RETAIN: f64 = 0.20; // Adjust as needed
+impl PredPenalty {
+    fn new(
+        class_pred: &ClassPrediction,
+        phase_pred: &PhasePrediction,
+        prob_floor: f64,
+        phase_retain: f64,
+    ) -> Self {
+        let phase_dilute = 1.0 - phase_retain;
 
-const PHASE_DILUTE: f64 = 1.0 - PHASE_RETAIN;
-const PRED_PROB_FLOOR: f64 = 0.000_000_001; // Prevent infinite penalties
-
-impl From<(&ClassPrediction, &PhasePrediction)> for PredPenalty {
-    fn from((class_pred, phase_pred): (&ClassPrediction, &PhasePrediction)) -> Self {
         let phase0 = phase_pred.get_phase0() as f64;
         let phase1 = phase_pred.get_phase1() as f64;
         let phase2 = phase_pred.get_phase2() as f64;
@@ -192,9 +348,7 @@ impl From<(&ClassPrediction, &PhasePrediction)> for PredPenalty {
         // Approach 1: rescale total phase to match coding and blend to dilution target (mean coding or total coding)
         let coding = class_pred.get_coding() as f64;
         let total_coding_phase = phase0 + phase1 + phase2;
-        let (phase0, phase1, phase2) = if total_coding_phase > 0.0
-        // Prevent div by zero risk
-        {
+        let (phase0, phase1, phase2) = if total_coding_phase > 0.0 {
             let phase_scale = coding / total_coding_phase;
             (
                 phase0 * phase_scale,
@@ -205,30 +359,12 @@ impl From<(&ClassPrediction, &PhasePrediction)> for PredPenalty {
             (coding / 3.0, coding / 3.0, coding / 3.0)
         };
 
-        //let dilution_target = coding / 3.0;
         let dilution_target = coding;
 
-        let phase0 = phase0 * PHASE_RETAIN + dilution_target * PHASE_DILUTE;
-        let phase1 = phase1 * PHASE_RETAIN + dilution_target * PHASE_DILUTE;
-        let phase2 = phase2 * PHASE_RETAIN + dilution_target * PHASE_DILUTE;
+        let phase0 = phase0 * phase_retain + dilution_target * phase_dilute;
+        let phase1 = phase1 * phase_retain + dilution_target * phase_dilute;
+        let phase2 = phase2 * phase_retain + dilution_target * phase_dilute;
 
-        /*
-                // Approach 2: rescale total phase to 1, dilute towards 1, then scale by coding
-                let total_coding_phase = phase0+phase1+phase2;
-                let (phase0, phase1, phase2) = if total_coding_phase > 0.0  // Prevent div by zero risk
-                    {
-                    let phase_scale = 1.0 / total_coding_phase;
-                    (phase0 * phase_scale, phase1 * phase_scale, phase2 * phase_scale)
-                    }
-                else { ( 1.0/3.0, 1.0/3.0, 1.0/3.0 ) };
-
-                let coding = class_pred.get_coding() as f64;
-                let phase0 = (phase0 * PHASE_RETAIN + 1.0 * PHASE_DILUTE) * coding;
-                let phase1 = (phase1 * PHASE_RETAIN + 1.0 * PHASE_DILUTE) * coding;
-                let phase2 = (phase2 * PHASE_RETAIN + 1.0 * PHASE_DILUTE) * coding;
-        */
-
-        // Convert to combined prob (not necessarily 1-hot)
         let raw_probs = [
             class_pred.get_intergenic() as f64,
             class_pred.get_utr() as f64,
@@ -238,14 +374,12 @@ impl From<(&ClassPrediction, &PhasePrediction)> for PredPenalty {
             class_pred.get_intron() as f64,
         ];
 
-        let neg_log_prob = raw_pred_to_neg_log_prob(&raw_probs, PRED_PROB_FLOOR);
+        let neg_log_prob = raw_pred_to_neg_log_prob(&raw_probs, prob_floor);
         let penalty = neg_log_prob_to_penalty(&neg_log_prob);
 
         PredPenalty { neg_log_prob, penalty }
     }
 }
-
-const BASE_PROB_FLOOR: f64 = 0.000_000_001; // Prevent infinite penalties
 
 #[derive(Clone, Copy)]
 pub struct BasesPenalty { // Ordering is C, A, T, G
@@ -288,11 +422,15 @@ impl BasesPenalty {
     }
 
     pub fn as_str(&self) -> char {
-        if self.penalty[0] < BASE_PROB_FLOOR {
+        // Pick the base whose normalised penalty is essentially zero (the
+        // most-likely class). Threshold is loose because the penalty array is
+        // already min-subtracted, so the winner sits at 0.0 in normal data.
+        const APPROX_ZERO: f64 = 1e-9;
+        if self.penalty[0] < APPROX_ZERO {
             'C'
-        } else if self.penalty[1] < BASE_PROB_FLOOR {
+        } else if self.penalty[1] < APPROX_ZERO {
             'A'
-        } else if self.penalty[2] < BASE_PROB_FLOOR {
+        } else if self.penalty[2] < APPROX_ZERO {
             'T'
         } else {
             'G'
@@ -300,12 +438,12 @@ impl BasesPenalty {
     }
 }
 
-impl From<&Bases> for BasesPenalty {
-    fn from(bases: &Bases) -> Self {
+impl BasesPenalty {
+    fn new(bases: &Bases, prob_floor: f64) -> Self {
         let raw_bases = bases.get();
 
         let converted_pred = convert_raw_pred(raw_bases);
-        let neg_log_prob = raw_pred_to_neg_log_prob(&converted_pred, BASE_PROB_FLOOR);
+        let neg_log_prob = raw_pred_to_neg_log_prob(&converted_pred, prob_floor);
         let penalty = neg_log_prob_to_penalty(&neg_log_prob);
 
         BasesPenalty { /*neg_log_prob, */ penalty }
@@ -313,6 +451,7 @@ impl From<&Bases> for BasesPenalty {
 }
 
 struct TransitionContext<'a> {
+    cfg: &'a HmmConfig,
     class_pred_pen: &'a [ClassPredPenalty],
     phase_pred_pen: &'a [PhasePredPenalty],
     pred_pen: &'a [PredPenalty],
@@ -324,6 +463,7 @@ struct TransitionContext<'a> {
 #[allow(dead_code)]
 impl<'a> TransitionContext<'a> {
     fn new(
+        cfg: &'a HmmConfig,
         class_pred_pen: &'a [ClassPredPenalty],
         phase_pred_pen: &'a [PhasePredPenalty],
         pred_pen: &'a [PredPenalty],
@@ -331,6 +471,7 @@ impl<'a> TransitionContext<'a> {
         offset: usize,
     ) -> TransitionContext<'a> {
         TransitionContext {
+            cfg,
             class_pred_pen,
             phase_pred_pen,
             pred_pen,
@@ -379,7 +520,7 @@ impl<'a> TransitionContext<'a> {
     fn get_donor_penalty_u2_gt_ag(&self, can_splice: bool) -> Option<f64> {
         if let (Some(ds), true) = (self.get_ctx(0, 2), can_splice) {
             let pen = ds[0].get_g() + ds[1].get_t();
-            Some(pen * DONOR_WEIGHT + DONOR_U2_GT_AG_FIXED_PENALTY)
+            Some(pen * self.cfg.weights.donor + self.cfg.donor_fixed_penalty.u2_gt_ag)
         } else {
             None
         }
@@ -388,7 +529,7 @@ impl<'a> TransitionContext<'a> {
     fn get_acceptor_penalty_u2_gt_ag(&self) -> Option<f64> {
         if let Some(us) = self.get_ctx(2, 0) {
             let pen = us[0].get_a() + us[1].get_g();
-            Some(pen * ACCEPTOR_WEIGHT)
+            Some(pen * self.cfg.weights.acceptor)
         } else {
             None
         }
@@ -401,7 +542,7 @@ impl<'a> TransitionContext<'a> {
                 ds[1].get_g() +
                 ds[2].get_g() +
                 ds[3].get_c();
-            Some(pen * DONOR_WEIGHT + DONOR_U2_GC_AG_FIXED_PENALTY)
+            Some(pen * self.cfg.weights.donor + self.cfg.donor_fixed_penalty.u2_gc_ag)
         } else {
             None
         }
@@ -410,7 +551,7 @@ impl<'a> TransitionContext<'a> {
     fn get_acceptor_penalty_u2_gc_ag(&self) -> Option<f64> {
         if let Some(us) = self.get_ctx(2, 0) {
             let pen = us[0].get_a() + us[1].get_g();
-            Some(pen * ACCEPTOR_WEIGHT)
+            Some(pen * self.cfg.weights.acceptor)
         } else {
             None
         }
@@ -427,7 +568,7 @@ impl<'a> TransitionContext<'a> {
                 ds[5].get_c() +
                 ds[6].get_t();
 
-            Some(pen * DONOR_WEIGHT + DONOR_U12_AT_AC_FIXED_PENALTY)
+            Some(pen * self.cfg.weights.donor + self.cfg.donor_fixed_penalty.u12_at_ac)
         } else {
             None
         }
@@ -436,7 +577,7 @@ impl<'a> TransitionContext<'a> {
     fn get_acceptor_penalty_u12_at_ac(&self) -> Option<f64> {
         if let Some(us) = self.get_ctx(2, 0) {
             let pen = us[0].get_a() + us[1].get_c();
-            Some(pen * ACCEPTOR_WEIGHT)
+            Some(pen * self.cfg.weights.acceptor)
         } else {
             None
         }
@@ -631,71 +772,6 @@ impl std::cmp::PartialOrd for HmmState {
 
         Some(s.cmp(&o))
     }
-}
-
-// Allow/Prevent introns within each state and/or at state transitions
-
-const CAN_SPLICE_UTR5: bool = true;
-const CAN_SPLICE_UTR5_START: bool = true;
-const CAN_SPLICE_START: bool = true;
-const CAN_SPLICE_START_CODING: bool = true;
-const CAN_SPLICE_CODING: bool = true;
-const CAN_SPLICE_CODING_STOP: bool = true;
-const CAN_SPLICE_STOP: bool = true;
-const CAN_SPLICE_STOP_UTR3: bool = true;
-const CAN_SPLICE_UTR3: bool = true;
-
-const START_WEIGHT: f64 = 1_000.0;
-
-const DONOR_U2_GT_AG_FIXED_PENALTY: f64 = 0.0;
-const DONOR_U2_GC_AG_FIXED_PENALTY: f64 = 0.0;
-const DONOR_U12_GT_AG_FIXED_PENALTY: f64 = 0.0;
-const DONOR_U12_AT_AC_FIXED_PENALTY: f64 = 0.0;
-
-const DONOR_WEIGHT: f64 = 1.0;
-
-const ACCEPTOR_WEIGHT: f64 = 1.0;
-
-const STOP_WEIGHT: f64 = 1_000.0;
-
-pub fn show_hmm_config() {
-    println!("HMM Config");
-    println!(
-        "  Splicing Flags: U:{} US:{} S:{} SC:{} C:{} CS:{} S:{} SU:{} U:{}",
-        CAN_SPLICE_UTR5,
-        CAN_SPLICE_UTR5_START,
-        CAN_SPLICE_START,
-        CAN_SPLICE_START_CODING,
-        CAN_SPLICE_CODING,
-        CAN_SPLICE_CODING_STOP,
-        CAN_SPLICE_STOP,
-        CAN_SPLICE_STOP_UTR3,
-        CAN_SPLICE_UTR3
-    );
-
-    println!(
-        "  Splicing - Weights: Donor {}, Acceptor {}",
-        DONOR_WEIGHT, ACCEPTOR_WEIGHT
-    );
-    println!(
-        "  Splicing - Fixed Penalties: U2-GT-AG {}, U2-GT-AC {} U12-GT-AG {} U12-AT-AC {}",
-        DONOR_U2_GT_AG_FIXED_PENALTY,
-        DONOR_U2_GC_AG_FIXED_PENALTY,
-        DONOR_U12_GT_AG_FIXED_PENALTY,
-        DONOR_U12_AT_AC_FIXED_PENALTY
-    );
-
-    println!(
-        "  Coding - Weights: Start {}, Stop {}",
-        START_WEIGHT, STOP_WEIGHT
-    );
-    //println!("  Phase Mode: Off");
-    //println!("  Phase Mode: Additive, with {} prob floor", PHASE_PRED_PROB_FLOOR);
-    println!(
-        "  Phase Mode: Implementation 1, Dilute to Total, Retention: {}",
-        PHASE_RETAIN
-    );
-    println!();
 }
 
 impl HmmState {
@@ -929,29 +1005,32 @@ impl HmmState {
 
             HmmPrimaryState::Start0 => trans_ctx
                 .get_downstream(1)
-                .map(|ds| ds[0].get_a() * START_WEIGHT),
+                .map(|ds| ds[0].get_a() * trans_ctx.cfg.weights.start),
             HmmPrimaryState::Start1 => trans_ctx
                 .get_downstream(1)
-                .map(|ds| ds[0].get_t() * START_WEIGHT),
+                .map(|ds| ds[0].get_t() * trans_ctx.cfg.weights.start),
             HmmPrimaryState::Start2 => trans_ctx
                 .get_downstream(1)
-                .map(|ds| ds[0].get_g() * START_WEIGHT),
+                .map(|ds| ds[0].get_g() * trans_ctx.cfg.weights.start),
 
             HmmPrimaryState::Coding0 => trans_ctx
                 .get_downstream(1)
-                .map(|ds| min3(ds[0].get_a(), ds[0].get_c(), ds[0].get_g()) * STOP_WEIGHT),
+                .map(|ds| {
+                    min3(ds[0].get_a(), ds[0].get_c(), ds[0].get_g())
+                        * trans_ctx.cfg.weights.stop
+                }),
             HmmPrimaryState::Coding1 => Some(0.0),
             HmmPrimaryState::Coding2 => Some(0.0),
 
             HmmPrimaryState::Stop0T => trans_ctx
                 .get_downstream(1)
-                .map(|ds| ds[0].get_t() * STOP_WEIGHT),
+                .map(|ds| ds[0].get_t() * trans_ctx.cfg.weights.stop),
             HmmPrimaryState::Stop1TA => trans_ctx
                 .get_downstream(1)
-                .map(|ds| ds[0].get_a() * STOP_WEIGHT),
+                .map(|ds| ds[0].get_a() * trans_ctx.cfg.weights.stop),
             HmmPrimaryState::Stop1TG => trans_ctx
                 .get_downstream(1)
-                .map(|ds| ds[0].get_g() * STOP_WEIGHT),
+                .map(|ds| ds[0].get_g() * trans_ctx.cfg.weights.stop),
             HmmPrimaryState::Stop2 => Some(0.0),
 
             HmmPrimaryState::UTR3 => Some(0.0),
@@ -999,19 +1078,19 @@ impl HmmState {
                     successors,
                     HmmState::UTR5IntronU2GtAgDSS,
                     Some(0.0),
-                    CAN_SPLICE_UTR5,
+                    trans_ctx.cfg.splice.utr5,
                 );
                 consider_transition(
                     successors,
                     HmmState::UTR5IntronU2GcAgDSS,
                     Some(0.0),
-                    CAN_SPLICE_UTR5,
+                    trans_ctx.cfg.splice.utr5,
                 );
                 consider_transition(
                     successors,
                     HmmState::UTR5IntronU12AtAcDSS,
                     Some(0.0),
-                    CAN_SPLICE_UTR5,
+                    trans_ctx.cfg.splice.utr5,
                 );
             }
 
@@ -1027,13 +1106,13 @@ impl HmmState {
                     successors,
                     HmmState::UTR5,
                     acceptor_penalty,
-                    CAN_SPLICE_UTR5,
+                    trans_ctx.cfg.splice.utr5,
                 );
                 consider_transition(
                     successors,
                     HmmState::Start0,
                     acceptor_penalty,
-                    CAN_SPLICE_UTR5_START,
+                    trans_ctx.cfg.splice.utr5_start,
                 );
             }
 
@@ -1043,19 +1122,19 @@ impl HmmState {
                     successors,
                     HmmState::Start0IntronU2GtAgDSS,
                     Some(0.0),
-                    CAN_SPLICE_START,
+                    trans_ctx.cfg.splice.start,
                 );
                 consider_transition(
                     successors,
                     HmmState::Start0IntronU2GcAgDSS,
                     Some(0.0),
-                    CAN_SPLICE_START,
+                    trans_ctx.cfg.splice.start,
                 );
                 consider_transition(
                     successors,
                     HmmState::Start0IntronU12AtAcDSS,
                     Some(0.0),
-                    CAN_SPLICE_START,
+                    trans_ctx.cfg.splice.start,
                 );
             }
 
@@ -1073,7 +1152,7 @@ impl HmmState {
                     successors,
                     HmmState::Start1,
                     acceptor_penalty,
-                    CAN_SPLICE_START,
+                    trans_ctx.cfg.splice.start,
                 );
             }
 
@@ -1083,19 +1162,19 @@ impl HmmState {
                     successors,
                     HmmState::Start1IntronU2GtAgDSS,
                     Some(0.0),
-                    CAN_SPLICE_START,
+                    trans_ctx.cfg.splice.start,
                 );
                 consider_transition(
                     successors,
                     HmmState::Start1IntronU2GcAgDSS,
                     Some(0.0),
-                    CAN_SPLICE_START,
+                    trans_ctx.cfg.splice.start,
                 );
                 consider_transition(
                     successors,
                     HmmState::Start1IntronU12AtAcDSS,
                     Some(0.0),
-                    CAN_SPLICE_START,
+                    trans_ctx.cfg.splice.start,
                 );
             }
 
@@ -1113,7 +1192,7 @@ impl HmmState {
                     successors,
                     HmmState::Start2,
                     acceptor_penalty,
-                    CAN_SPLICE_START,
+                    trans_ctx.cfg.splice.start,
                 );
             }
 
@@ -1124,19 +1203,19 @@ impl HmmState {
                     successors,
                     HmmState::Coding0IntronU2GtAgDSS,
                     Some(0.0),
-                    CAN_SPLICE_CODING,
+                    trans_ctx.cfg.splice.coding,
                 );
                 consider_transition(
                     successors,
                     HmmState::Coding0IntronU2GcAgDSS,
                     Some(0.0),
-                    CAN_SPLICE_CODING,
+                    trans_ctx.cfg.splice.coding,
                 );
                 consider_transition(
                     successors,
                     HmmState::Coding0IntronU12AtAcDSS,
                     Some(0.0),
-                    CAN_SPLICE_CODING,
+                    trans_ctx.cfg.splice.coding,
                 );
             }
 
@@ -1158,7 +1237,7 @@ impl HmmState {
                     successors,
                     HmmState::Coding1,
                     acceptor_penalty,
-                    CAN_SPLICE_CODING,
+                    trans_ctx.cfg.splice.coding,
                 );
             }
 
@@ -1169,19 +1248,19 @@ impl HmmState {
                     successors,
                     HmmState::Coding1IntronU2GtAgDSS,
                     Some(0.0),
-                    CAN_SPLICE_CODING,
+                    trans_ctx.cfg.splice.coding,
                 );
                 consider_transition(
                     successors,
                     HmmState::Coding1IntronU2GcAgDSS,
                     Some(0.0),
-                    CAN_SPLICE_CODING,
+                    trans_ctx.cfg.splice.coding,
                 );
                 consider_transition(
                     successors,
                     HmmState::Coding1IntronU12AtAcDSS,
                     Some(0.0),
-                    CAN_SPLICE_CODING,
+                    trans_ctx.cfg.splice.coding,
                 );
             }
 
@@ -1203,7 +1282,7 @@ impl HmmState {
                     successors,
                     HmmState::Coding2,
                     acceptor_penalty,
-                    CAN_SPLICE_CODING,
+                    trans_ctx.cfg.splice.coding,
                 );
             }
 
@@ -1215,19 +1294,19 @@ impl HmmState {
                     successors,
                     HmmState::Coding2IntronU2GtAgDSS,
                     Some(0.0),
-                    CAN_SPLICE_CODING,
+                    trans_ctx.cfg.splice.coding,
                 );
                 consider_transition(
                     successors,
                     HmmState::Coding2IntronU2GcAgDSS,
                     Some(0.0),
-                    CAN_SPLICE_CODING,
+                    trans_ctx.cfg.splice.coding,
                 );
                 consider_transition(
                     successors,
                     HmmState::Coding2IntronU12AtAcDSS,
                     Some(0.0),
-                    CAN_SPLICE_CODING,
+                    trans_ctx.cfg.splice.coding,
                 );
             }
 
@@ -1249,13 +1328,13 @@ impl HmmState {
                     successors,
                     HmmState::Coding0,
                     acceptor_penalty,
-                    CAN_SPLICE_CODING,
+                    trans_ctx.cfg.splice.coding,
                 );
                 consider_transition(
                     successors,
                     HmmState::Stop0T,
                     acceptor_penalty,
-                    CAN_SPLICE_CODING_STOP,
+                    trans_ctx.cfg.splice.coding_stop,
                 );
             }
 
@@ -1269,7 +1348,7 @@ impl HmmState {
                     consider_transition(
                         successors,
                         HmmState::Coding1,
-                        Some(min2(ds[0].get_c(), ds[0].get_t()) * STOP_WEIGHT),
+                        Some(min2(ds[0].get_c(), ds[0].get_t()) * trans_ctx.cfg.weights.stop),
                         true,
                     );
                 }
@@ -1278,19 +1357,19 @@ impl HmmState {
                     successors,
                     HmmState::Stop0TIntronU2GtAgDSS,
                     Some(0.0),
-                    CAN_SPLICE_STOP,
+                    trans_ctx.cfg.splice.stop,
                 );
                 consider_transition(
                     successors,
                     HmmState::Stop0TIntronU2GcAgDSS,
                     Some(0.0),
-                    CAN_SPLICE_STOP,
+                    trans_ctx.cfg.splice.stop,
                 );
                 consider_transition(
                     successors,
                     HmmState::Stop0TIntronU12AtAcDSS,
                     Some(0.0),
-                    CAN_SPLICE_STOP,
+                    trans_ctx.cfg.splice.stop,
                 );
             }
 
@@ -1313,8 +1392,8 @@ impl HmmState {
                     consider_transition(
                         successors,
                         HmmState::Coding1,
-                        Some(acceptor_penalty + min2(ds[0].get_c(), ds[0].get_t()) * STOP_WEIGHT),
-                        CAN_SPLICE_STOP,
+                        Some(acceptor_penalty + min2(ds[0].get_c(), ds[0].get_t()) * trans_ctx.cfg.weights.stop),
+                        trans_ctx.cfg.splice.stop,
                     );
                 }
             }
@@ -1326,13 +1405,13 @@ impl HmmState {
                     consider_transition(
                         successors,
                         HmmState::Stop2,
-                        Some(min2(ds[0].get_a(), ds[0].get_g()) * STOP_WEIGHT),
+                        Some(min2(ds[0].get_a(), ds[0].get_g()) * trans_ctx.cfg.weights.stop),
                         true,
                     );
                     consider_transition(
                         successors,
                         HmmState::Coding2,
-                        Some(min2(ds[0].get_c(), ds[0].get_t()) * STOP_WEIGHT),
+                        Some(min2(ds[0].get_c(), ds[0].get_t()) * trans_ctx.cfg.weights.stop),
                         true,
                     );
                 }
@@ -1341,19 +1420,19 @@ impl HmmState {
                     successors,
                     HmmState::Stop1TAIntronU2GtAgDSS,
                     Some(0.0),
-                    CAN_SPLICE_STOP,
+                    trans_ctx.cfg.splice.stop,
                 );
                 consider_transition(
                     successors,
                     HmmState::Stop1TAIntronU2GcAgDSS,
                     Some(0.0),
-                    CAN_SPLICE_STOP,
+                    trans_ctx.cfg.splice.stop,
                 );
                 consider_transition(
                     successors,
                     HmmState::Stop1TAIntronU12AtAcDSS,
                     Some(0.0),
-                    CAN_SPLICE_STOP,
+                    trans_ctx.cfg.splice.stop,
                 );
             }
 
@@ -1378,13 +1457,13 @@ impl HmmState {
                     consider_transition(
                         successors,
                         HmmState::Stop2,
-                        Some(acceptor_penalty + min2(ds[0].get_a(), ds[0].get_g()) * STOP_WEIGHT),
+                        Some(acceptor_penalty + min2(ds[0].get_a(), ds[0].get_g()) * trans_ctx.cfg.weights.stop),
                         true,
                     );
                     consider_transition(
                         successors,
                         HmmState::Coding2,
-                        Some(acceptor_penalty + min2(ds[0].get_c(), ds[0].get_t()) * STOP_WEIGHT),
+                        Some(acceptor_penalty + min2(ds[0].get_c(), ds[0].get_t()) * trans_ctx.cfg.weights.stop),
                         true,
                     );
                 }
@@ -1397,13 +1476,13 @@ impl HmmState {
                     consider_transition(
                         successors,
                         HmmState::Stop2,
-                        Some(ds[0].get_a() * STOP_WEIGHT),
+                        Some(ds[0].get_a() * trans_ctx.cfg.weights.stop),
                         true,
                     );
                     consider_transition(
                         successors,
                         HmmState::Coding2,
-                        Some(min3(ds[0].get_c(), ds[0].get_g(), ds[0].get_t()) * STOP_WEIGHT),
+                        Some(min3(ds[0].get_c(), ds[0].get_g(), ds[0].get_t()) * trans_ctx.cfg.weights.stop),
                         true,
                     );
                 }
@@ -1412,19 +1491,19 @@ impl HmmState {
                     successors,
                     HmmState::Stop1TGIntronU2GtAgDSS,
                     Some(0.0),
-                    CAN_SPLICE_STOP,
+                    trans_ctx.cfg.splice.stop,
                 );
                 consider_transition(
                     successors,
                     HmmState::Stop1TGIntronU2GcAgDSS,
                     Some(0.0),
-                    CAN_SPLICE_STOP,
+                    trans_ctx.cfg.splice.stop,
                 );
                 consider_transition(
                     successors,
                     HmmState::Stop1TGIntronU12AtAcDSS,
                     Some(0.0),
-                    CAN_SPLICE_STOP,
+                    trans_ctx.cfg.splice.stop,
                 );
             }
 
@@ -1449,7 +1528,7 @@ impl HmmState {
                     consider_transition(
                         successors,
                         HmmState::Stop2,
-                        Some(acceptor_penalty + ds[0].get_a() * STOP_WEIGHT),
+                        Some(acceptor_penalty + ds[0].get_a() * trans_ctx.cfg.weights.stop),
                         true,
                     );
                     consider_transition(
@@ -1457,7 +1536,7 @@ impl HmmState {
                         HmmState::Coding2,
                         Some(
                             acceptor_penalty
-                                + min3(ds[0].get_c(), ds[0].get_g(), ds[0].get_t()) * STOP_WEIGHT,
+                                + min3(ds[0].get_c(), ds[0].get_g(), ds[0].get_t()) * trans_ctx.cfg.weights.stop,
                         ),
                         true,
                     );
@@ -1470,19 +1549,19 @@ impl HmmState {
                     successors,
                     HmmState::UTR3IntronU2GtAgDSS,
                     Some(0.0),
-                    CAN_SPLICE_STOP_UTR3,
+                    trans_ctx.cfg.splice.stop_utr3,
                 );
                 consider_transition(
                     successors,
                     HmmState::UTR3IntronU2GcAgDSS,
                     Some(0.0),
-                    CAN_SPLICE_STOP_UTR3,
+                    trans_ctx.cfg.splice.stop_utr3,
                 );
                 consider_transition(
                     successors,
                     HmmState::UTR3IntronU12AtAcDSS,
                     Some(0.0),
-                    CAN_SPLICE_STOP_UTR3,
+                    trans_ctx.cfg.splice.stop_utr3,
                 );
             }
 
@@ -1493,19 +1572,19 @@ impl HmmState {
                     successors,
                     HmmState::UTR3IntronU2GtAgDSS,
                     Some(0.0),
-                    CAN_SPLICE_UTR3,
+                    trans_ctx.cfg.splice.utr3,
                 );
                 consider_transition(
                     successors,
                     HmmState::UTR3IntronU2GcAgDSS,
                     Some(0.0),
-                    CAN_SPLICE_UTR3,
+                    trans_ctx.cfg.splice.utr3,
                 );
                 consider_transition(
                     successors,
                     HmmState::UTR3IntronU12AtAcDSS,
                     Some(0.0),
-                    CAN_SPLICE_UTR3,
+                    trans_ctx.cfg.splice.utr3,
                 );
             }
 
@@ -1521,7 +1600,7 @@ impl HmmState {
                     successors,
                     HmmState::UTR3,
                     acceptor_penalty,
-                    CAN_SPLICE_UTR3,
+                    trans_ctx.cfg.splice.utr3,
                 );
             }
         }
@@ -1597,6 +1676,7 @@ impl PartialOrd for HmmEval {
 const MAX_EVALS: u64 = 100_000_000_000;
 
 pub struct PredictionHmm {
+    cfg: Arc<HmmConfig>,
     class_pred_pen: Vec<ClassPredPenalty>,
     phase_pred_pen: Vec<PhasePredPenalty>,
 
@@ -1609,7 +1689,13 @@ pub struct PredictionHmm {
 }
 
 impl PredictionHmm {
-    pub fn new(bp_vector: Vec<(Bases, ClassPrediction, PhasePrediction)>) -> PredictionHmm {
+    pub fn new(
+        bp_vector: Vec<(Bases, ClassPrediction, PhasePrediction)>,
+        cfg: Arc<HmmConfig>,
+    ) -> PredictionHmm {
+        let prob_floor = cfg.prob_floor;
+        let phase_retain = cfg.phase_retain;
+
         let mut class_pred_pen = Vec::with_capacity(bp_vector.len());
         let mut phase_pred_pen = Vec::with_capacity(bp_vector.len());
         let mut pred_pen = Vec::with_capacity(bp_vector.len());
@@ -1617,11 +1703,11 @@ impl PredictionHmm {
         let mut bases_pen = Vec::with_capacity(bp_vector.len());
 
         for (bases, class_pred, phase_pred) in bp_vector.iter() {
-            class_pred_pen.push(class_pred.into());
-            phase_pred_pen.push(phase_pred.into());
-            pred_pen.push((class_pred, phase_pred).into());
+            class_pred_pen.push(ClassPredPenalty::new(class_pred, prob_floor));
+            phase_pred_pen.push(PhasePredPenalty::new(phase_pred, prob_floor));
+            pred_pen.push(PredPenalty::new(class_pred, phase_pred, prob_floor, phase_retain));
 
-            bases_pen.push(bases.into());
+            bases_pen.push(BasesPenalty::new(bases, prob_floor));
         }
 
         let total_states = (bp_vector.len() + 1) * HMM_STATES;
@@ -1629,6 +1715,7 @@ impl PredictionHmm {
 
         let eval_heap = BinaryHeap::new();
         PredictionHmm {
+            cfg,
             class_pred_pen,
             phase_pred_pen,
             pred_pen,
@@ -1666,6 +1753,7 @@ impl PredictionHmm {
         }
 
         let trans_ctx = TransitionContext::new(
+            &self.cfg,
             &self.class_pred_pen,
             &self.phase_pred_pen,
             &self.pred_pen,
