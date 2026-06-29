@@ -75,9 +75,7 @@ impl<I: Iterator<Item = BpItem>> BasePredictionWindow<I> {
         self.window.len() == self.window_size
     }
 
-    pub fn get_window_iter(&self) -> Iter<'_, BpItem> {
-        self.window.iter()
-    }
+    pub fn get_window_iter(&self) -> Iter<'_, BpItem> { self.window.iter() }
 }
 
 pub struct BasePredictionWindowThresholdScanner<I: Iterator<Item = BpItem>> {
