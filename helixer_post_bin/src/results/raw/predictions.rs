@@ -1,6 +1,7 @@
 use super::super::{Error, Result};
-use hdf5::{types::VarLenUnicode, Dataset, File};
+use hdf5_metno::{types::VarLenUnicode, Dataset, File};
 use std::path::Path;
+use crate::results::error::FromCtx;
 
 pub struct RawHelixerPredictions {
     predictions_file: File,
@@ -11,18 +12,49 @@ const PHASE_DATASIZE: usize = 4;
 
 impl RawHelixerPredictions {
     pub fn new(predictions_file_path: &Path) -> Result<RawHelixerPredictions> {
-        let predictions_file = File::open(predictions_file_path)?;
+        let predictions_file = match File::open(predictions_file_path) {
+            Ok(f) => f,
+            Err(e) => {
+                let ctx = format!("opening {predictions_file_path:?} as predictions HDF5");
+                return Err(Error::from_ctx(&ctx, e))
+            }
+        };
         Ok(RawHelixerPredictions { predictions_file })
     }
 
     pub fn get_model_md5sum(&self) -> Result<String> {
-        let attr = self.predictions_file.attr("model_md5sum")?;
-        let r: VarLenUnicode = attr.as_reader().read_scalar()?;
+
+        let attr = match self.predictions_file.attr("model_md5sum") {
+            Ok(a) => a,
+            Err(e) => {
+                return Err(Error::from_ctx("reading 'model_md5sum' attribute from predictions HDF5", e))
+            }
+        };
+
+        let r: VarLenUnicode = match attr.as_reader().read_scalar() {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(Error::from_ctx("reading 'model_md5sum' attribute value from predictions HDF5", e))
+            }
+        };
+
         Ok(r.to_string())
     }
 
+    fn get_dataset_raw(&self, name: &str) -> Result<Dataset> {
+        let dataset = match self.predictions_file.dataset(name) {
+            Ok(f) => f,
+            Err(e) => {
+                let ctx = format!("reading '{name}' dataset from predictions HDF5");
+                return Err(Error::from_ctx(&ctx, e))
+            }
+        };
+
+        Ok(dataset)
+    }
+
     pub fn get_class_raw(&self) -> Result<Dataset> {
-        let pred_dataset = self.predictions_file.dataset("predictions")?;
+        let pred_dataset = self.get_dataset_raw("predictions")?;
 
         let shape = pred_dataset.shape();
         if shape.len() != 3 {
@@ -37,7 +69,7 @@ impl RawHelixerPredictions {
     }
 
     pub fn get_phase_raw(&self) -> Result<Dataset> {
-        let phase_dataset = self.predictions_file.dataset("predictions_phase")?;
+        let phase_dataset = self.get_dataset_raw("predictions_phase")?;
 
         let shape = phase_dataset.shape();
         if shape.len() != 3 {
